@@ -18,6 +18,8 @@ package org.apache.activemq.artemis.tests.integration.ra;
 
 import javax.jms.QueueConnection;
 import javax.jms.Session;
+import javax.resource.spi.ConnectionEvent;
+import javax.resource.spi.ConnectionEventListener;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -30,9 +32,11 @@ import org.apache.activemq.artemis.api.core.client.ClientSession;
 import org.apache.activemq.artemis.core.client.impl.ServerLocatorImpl;
 import org.apache.activemq.artemis.core.server.Queue;
 import org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory;
+import org.apache.activemq.artemis.logs.AssertionLoggerHandler;
 import org.apache.activemq.artemis.ra.ActiveMQRAConnectionFactory;
 import org.apache.activemq.artemis.ra.ActiveMQRAConnectionFactoryImpl;
 import org.apache.activemq.artemis.ra.ActiveMQRAConnectionManager;
+import org.apache.activemq.artemis.ra.ActiveMQRAConnectionRequestInfo;
 import org.apache.activemq.artemis.ra.ActiveMQRAManagedConnection;
 import org.apache.activemq.artemis.ra.ActiveMQRAManagedConnectionFactory;
 import org.apache.activemq.artemis.ra.ActiveMQRASession;
@@ -40,6 +44,7 @@ import org.apache.activemq.artemis.ra.ActiveMQResourceAdapter;
 import org.apache.activemq.artemis.ra.inflow.ActiveMQActivation;
 import org.apache.activemq.artemis.ra.inflow.ActiveMQActivationSpec;
 import org.apache.activemq.artemis.tests.util.Wait;
+import org.junit.Assert;
 import org.junit.Test;
 
 public class ActiveMQClusteredTest extends ActiveMQRAClusteredTestBase {
@@ -167,6 +172,71 @@ public class ActiveMQClusteredTest extends ActiveMQRAClusteredTestBase {
             mc.destroy();
          }
       }
+   }
+
+   @Test
+   public void testConcurrency() throws Exception {
+      AssertionLoggerHandler loggerHandler = new AssertionLoggerHandler();
+      ActiveMQResourceAdapter qResourceAdapter = newResourceAdapter();
+
+      ConnectionEventListener cl = new ConnectionEventListener() {
+         @Override
+         public void connectionClosed(ConnectionEvent connectionEvent) {
+            ActiveMQRASession session = new ActiveMQRASession((ActiveMQRAManagedConnection) connectionEvent.getSource(),
+                    new ActiveMQRAConnectionRequestInfo(false, 1, 1));
+            // simulate a thread using freed-up resources
+            new Thread(() -> {
+               try {
+                  session.createTemporaryQueue();
+               } catch (Exception e) {
+               }
+            }).start();
+         }
+
+         @Override
+         public void localTransactionStarted(ConnectionEvent connectionEvent) {
+         }
+
+         @Override
+         public void localTransactionCommitted(ConnectionEvent connectionEvent) {
+         }
+
+         @Override
+         public void localTransactionRolledback(ConnectionEvent connectionEvent) {
+         }
+
+         @Override
+         public void connectionErrorOccurred(ConnectionEvent connectionEvent) {
+         }
+      };
+      ActiveMQRAManagedConnection mc = null;
+      QueueConnection queueConnection = null;
+      try {
+         MyBootstrapContext ctx = new MyBootstrapContext();
+         qResourceAdapter.start(ctx);
+         ActiveMQRAConnectionManager qraConnectionManager = new ActiveMQRAConnectionManager();
+         ActiveMQRAManagedConnectionFactory mcf = new ActiveMQRAManagedConnectionFactory();
+         mcf.setResourceAdapter(qResourceAdapter);
+         ActiveMQRAConnectionFactory qraConnectionFactory = new ActiveMQRAConnectionFactoryImpl(mcf, qraConnectionManager);
+
+         queueConnection = qraConnectionFactory.createQueueConnection();
+         Session s = queueConnection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+         mc = (ActiveMQRAManagedConnection) ((ActiveMQRASession) s).getManagedConnection();
+         mc.addConnectionEventListener(cl);
+
+         s.createTemporaryQueue();
+      } finally {
+         // close connection; previously created temp queue is going to be deleted
+         if (queueConnection != null) {
+            queueConnection.close();
+         }
+
+         if (mc != null) {
+            mc.destroy();
+         }
+      }
+
+      Assert.assertFalse(loggerHandler.findText("AMQ212051"));
    }
 
    @Test
